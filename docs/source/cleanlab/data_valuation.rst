@@ -1,7 +1,7 @@
-fasttext
-========
+data_valuation
+==============
 
-.. automodule:: cleanlab.models.fasttext
+.. automodule:: cleanlab.data_valuation
    :autosummary:
    :members:
    :undoc-members:

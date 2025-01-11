@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, List
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from numpy import ndarray
 
 from cleanlab.datalab.internal.issue_manager import IssueManager
 
@@ -34,12 +33,14 @@ class NullIssueManager(IssueManager):
     }
 
     @staticmethod
-    def _calculate_null_issues(features: npt.NDArray) -> tuple[ndarray, ndarray, Any]:
+    def _calculate_null_issues(
+        features: npt.NDArray[Any],
+    ) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
         """Tracks the number of null values in each row of a feature array,
         computes quality scores based on the fraction of null values in each row,
         and returns a boolean array indicating whether each row only has null values."""
         cols = features.shape[1]
-        null_tracker = np.isnan(features)
+        null_tracker = pd.isna(features)
         non_null_count = cols - null_tracker.sum(axis=1)
         scores = non_null_count / cols
         is_null_issue = non_null_count == 0
@@ -47,11 +48,15 @@ class NullIssueManager(IssueManager):
 
     def find_issues(
         self,
-        features: Optional[npt.NDArray] = None,
+        features: Optional[npt.NDArray | pd.DataFrame] = None,
         **kwargs,
     ) -> None:
         if features is None:
             raise ValueError("features must be provided to check for null values.")
+        # Support features as a numpy array. Temporarily allow this issuecheck to convert a DataFrame to a numpy array.
+        if isinstance(features, pd.DataFrame):
+            features = features.to_numpy()
+
         is_null_issue, scores, null_tracker = self._calculate_null_issues(features=features)
 
         self.issues = pd.DataFrame(
@@ -86,8 +91,8 @@ class NullIssueManager(IssueManager):
         most_frequent_pattern = "no_null"
         rows_affected: List[int] = []
         occurrence_of_most_frequent_pattern = 0
-        if null_tracker.any():
-            null_row_indices = np.where(null_tracker.any(axis=1))[0]
+        if np.any(null_tracker, axis=None):
+            null_row_indices = np.where(np.any(null_tracker, axis=1))[0]
             null_patterns_as_strings = [
                 "".join(map(str, null_tracker[i].astype(int).tolist())) for i in null_row_indices
             ]

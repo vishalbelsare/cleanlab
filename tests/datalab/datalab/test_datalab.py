@@ -28,11 +28,15 @@ import pandas as pd
 import pytest
 from datasets.dataset_dict import DatasetDict
 from scipy.sparse import csr_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.datasets import make_blobs
 
 import cleanlab
 from cleanlab.datalab.datalab import Datalab
+from cleanlab.datalab.internal.issue_manager.knn_graph_helpers import num_neighbors_in_knn_graph
 from cleanlab.datalab.internal.report import Reporter
 from cleanlab.datalab.internal.task import Task
 
@@ -45,6 +49,36 @@ def test_datalab_invalid_datasetdict(dataset, label_name):
         datadict = DatasetDict({"train": dataset, "test": dataset})
         Datalab(datadict, label_name)  # type: ignore
         assert "Please pass a single dataset, not a DatasetDict." in str(e)
+
+
+def check_issues_dtypes(lab):
+    """
+    Asserts that each column in lab.issues has the expected dtype.
+
+    """
+
+    for col in lab.issues.filter(like="is_").columns:
+        assert lab.issues[col].dtype.kind == "b", f"Column '{col}' must be boolean."
+
+    for col in lab.issues.filter(like="_score").columns:
+        assert lab.issues[col].dtype.kind in {"i", "f"}, f"Column '{col}' must be numeric."
+
+
+def check_issue_summary_dtypes(lab):
+    """
+    Asserts that each column in lab.issue_summary has the expected dtype.
+
+    """
+
+    for col in ["score", "num_issues"]:
+        series = lab.issue_summary[col]
+        dtype = series.dtype
+        assert np.issubdtype(dtype, np.number), f"Column '{col}' must be numeric"
+
+
+def check_lab_dtypes(lab):
+    check_issues_dtypes(lab)
+    check_issue_summary_dtypes(lab)
 
 
 @pytest.fixture(scope="function")
@@ -242,6 +276,7 @@ class TestDatalab:
         assert lab.issue_summary.empty, "Issue summary should be empty before calling find_issues"
         assert lab.info["statistics"]["health_score"] is None
         lab.find_issues(pred_probs=pred_probs, issue_types=issue_types)
+        check_lab_dtypes(lab)
         assert not lab.issues.empty, "Issues weren't updated"
         assert not lab.issue_summary.empty, "Issue summary wasn't updated"
         assert (
@@ -327,6 +362,7 @@ class TestDatalab:
         large_lab.find_issues(
             features=features, pred_probs=pred_probs, knn_graph=knn_graph, issue_types=issue_types
         )
+        check_lab_dtypes(large_lab)
         with contextlib.redirect_stdout(io.StringIO()) as f:
             large_lab.report()
         first_report = f.getvalue()
@@ -351,14 +387,14 @@ class TestDatalab:
         embedding_size = 2
         mock_embeddings = np.random.rand(dataset_size, embedding_size)
 
-        knn = NearestNeighbors(n_neighbors=k, metric=metric)
-        issue_types = {"outlier": {"knn": knn}}
+        issue_types = {"outlier": {"k": k, "metric": metric}}
         assert lab.get_info("statistics").get("weighted_knn_graph") is None
         lab.find_issues(
             pred_probs=pred_probs,
             features=mock_embeddings,
             issue_types=issue_types,
         )
+        check_lab_dtypes(lab)
         assert lab.info["outlier"]["k"] == k
         statistics = lab.get_info("statistics")
         assert statistics["knn_metric"] == metric
@@ -389,6 +425,7 @@ class TestDatalab:
         monkeypatch.setattr(lab, "issue_summary", mock_issue_summary)
 
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         # Check that the issues dataframe has the right columns
         expected_issues_df = pd.DataFrame(
             {
@@ -590,6 +627,7 @@ class TestDatalabUsingKNNGraph:
         lab, knn_graph, _ = data_tuple
         assert lab.get_info("statistics").get("weighted_knn_graph") is None
         lab.find_issues(knn_graph=knn_graph)
+        check_lab_dtypes(lab)
         knn_graph_stats = lab.get_info("statistics").get("weighted_knn_graph")
         np.testing.assert_array_equal(knn_graph_stats.toarray(), knn_graph.toarray())
 
@@ -599,16 +637,28 @@ class TestDatalabUsingKNNGraph:
         """Test that the `knn_graph` argument to `find_issues` is used instead of computing a new
         one from the `features` argument."""
         lab, knn_graph, features = data_tuple
-        k = 4
-        lab.find_issues(knn_graph=knn_graph, features=features, issue_types={"outlier": {"k": k}})
+
+        assert lab.get_info("statistics").get("weighted_knn_graph") is None
+        lab.find_issues(knn_graph=knn_graph, features=features, issue_types={"outlier": {"k": 4}})
+        check_lab_dtypes(lab)
         knn_graph_stats = lab.get_info("statistics").get("weighted_knn_graph")
-        assert knn_graph_stats.nnz == k * len(
-            lab.data
-        ), f"Expected {k * len(lab.data)} nnz, got {knn_graph_stats.nnz}"
-        three_nn_dists = knn_graph_stats.data.reshape(len(lab.data), k)[:, :3]
-        knn_graph_three_nn_dists = knn_graph.data.reshape(len(lab.data), k - 1)
+
+        # expect_k is 3 because we're using the passed-in knn_graph, not the k specified in the issue_types
+        expect_k = 3
+        actual_k_stats = num_neighbors_in_knn_graph(knn_graph_stats)
+        assert (
+            actual_k_stats == expect_k
+        ), f"Expected {expect_k} neighbors in knn_graph, got {actual_k_stats}"
+
+        # Reshape to unknown number of columns (-1) to match the flexible nature of knn_graph
+        # But we still expect at least 3 columns for the nearest neighbors
+        three_nn_dists = knn_graph_stats.data.reshape(len(lab.data), -1)[:, :3]
+        knn_graph_three_nn_dists = knn_graph.data.reshape(len(lab.data), -1)
         np.testing.assert_array_equal(three_nn_dists, knn_graph_three_nn_dists)
-        assert lab.get_info("statistics").get("knn_metric") == "cosine"
+
+        # We no longer store knn_metric in statistics when a knn_graph is passed explicitly
+        # The user is responsible for tracking their own metrics in this case
+        assert lab.get_info("statistics").get("knn_metric") == None
 
     def test_without_features_or_knn_graph(self, data_tuple):
         """Test that only the class_imbalance issue is run
@@ -617,13 +667,15 @@ class TestDatalabUsingKNNGraph:
 
         # Test that a warning is raised
         lab.find_issues()
+        check_lab_dtypes(lab)
         # Only class_imbalance issue columns should be present
         assert list(lab.issues.columns) == ["is_class_imbalance_issue", "class_imbalance_score"]
 
     def test_data_valuation_issue_with_knn_graph(self, data_tuple):
         lab, knn_graph, features = data_tuple
         assert lab.get_info("statistics").get("weighted_knn_graph") is None
-        lab.find_issues(knn_graph=knn_graph, issue_types={"data_valuation": {}})
+        lab.find_issues(knn_graph=knn_graph, issue_types={"data_valuation": {"k": 3}})
+        check_lab_dtypes(lab)
         score = lab.get_issues().get(["data_valuation_score"])
         assert isinstance(score, pd.DataFrame)
         assert len(score) == len(lab.data)
@@ -631,20 +683,22 @@ class TestDatalabUsingKNNGraph:
     def test_data_valuation_issue_with_existing_knn_graph(self, data_tuple):
         lab, knn_graph, features = data_tuple
         lab.find_issues(features=features, issue_types={"outlier": {"k": 3}})
-        lab.find_issues(issue_types={"data_valuation": {}})
+        lab.find_issues(issue_types={"data_valuation": {"k": 3}})
+        check_lab_dtypes(lab)
         score = lab.get_issues().get(["data_valuation_score"])
         assert isinstance(score, pd.DataFrame)
         assert len(score) == len(lab.data)
 
         # Compare this with directly passing in a knn_graph
         lab_2 = Datalab(data=lab.data, label_name=lab.label_name)
-        lab_2.find_issues(knn_graph=knn_graph, issue_types={"data_valuation": {}})
+        lab_2.find_issues(knn_graph=knn_graph, issue_types={"data_valuation": {"k": 3}})
         score_2 = lab_2.get_issues().get(["data_valuation_score"])
         pd.testing.assert_frame_equal(score, score_2)
 
     def test_data_valuation_issue_without_knn_graph(self, data_tuple):
         lab, _, features = data_tuple
         lab.find_issues(features=features, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
         assert (
             lab.issues.empty
         ), "The issues dataframe should be empty as the issue manager expects an existing knn_graph"
@@ -686,6 +740,7 @@ class TestDatalabIssueManagerInteraction:
         assert lab.issue_summary.empty
 
         lab.find_issues(issue_types={"custom_issue": {}})
+        check_lab_dtypes(lab)
 
         expected_is_custom_issue_issue = [False, True] + [False] * 3
         expected_custom_issue_score = [1 / 1, 0 / 2, 1 / 3, 2 / 4, 3 / 5]
@@ -710,6 +765,7 @@ class TestDatalabIssueManagerInteraction:
         assert lab.issue_summary.empty
 
         lab.find_issues(issue_types={"custom_issue": {"custom_argument": 3}})
+        check_lab_dtypes(lab)
 
         expected_is_custom_issue_issue = [False, False, False, True, False]
         expected_custom_issue_score = [3 / 3, 2 / 4, 1 / 5, 0 / 6, 1 / 7]
@@ -742,6 +798,7 @@ def test_report_for_outlier_issues_via_pred_probs(find_issues_kwargs):
     lab = Datalab(data=data, label_name="labels")
     find_issues_kwargs["issue_types"] = {"outlier": {"k": 1}}
     lab.find_issues(**find_issues_kwargs)
+    check_lab_dtypes(lab)
 
     reporter = Reporter(
         lab.data_issues, task=Task.CLASSIFICATION, verbosity=0, include_description=False
@@ -771,6 +828,7 @@ def test_near_duplicates_reuses_knn_graph():
         lambda: lab.find_issues(features=features, **find_issues_kwargs),
         number=1,
     )
+    check_lab_dtypes(lab)
 
     # Run 2: near_duplicate and outlier with same k
     lab = Datalab(data=data, label_name="labels")
@@ -782,6 +840,7 @@ def test_near_duplicates_reuses_knn_graph():
         lambda: lab.find_issues(features=features, **find_issues_kwargs),
         number=1,
     )
+    check_lab_dtypes(lab)
 
     # Run 3: Same Datalab instance with same issues, but in different order
     find_issues_kwargs = {
@@ -791,6 +850,8 @@ def test_near_duplicates_reuses_knn_graph():
         lambda: lab.find_issues(features=features, **find_issues_kwargs),
         number=1,
     )
+
+    check_lab_dtypes(lab)
 
     # Run 2 does an extra check, so it should be slower
     assert time_only_near_duplicates < time_near_duplicates_and_outlier, (
@@ -850,6 +911,7 @@ class TestDatalabFindNonIIDIssues:
 
     def test_find_non_iid_issues(self, lab, random_embeddings):
         lab.find_issues(features=random_embeddings, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert ["non_iid"] == summary["issue_type"].values
         assert summary["score"].values[0] > 0.05
@@ -858,6 +920,7 @@ class TestDatalabFindNonIIDIssues:
     def test_find_non_iid_issues_using_pred_probs(self, lab, random_embeddings):
         pred_probs = pred_probs_from_features(random_embeddings)
         lab.find_issues(pred_probs=pred_probs, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert ["non_iid"] == summary["issue_type"].values
         assert summary["score"].values[0] > 0.05
@@ -866,6 +929,7 @@ class TestDatalabFindNonIIDIssues:
 
     def test_find_non_iid_issues_sorted(self, lab, sorted_embeddings):
         lab.find_issues(features=sorted_embeddings, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert ["non_iid"] == summary["issue_type"].values
         assert summary["score"].values[0] == 0
@@ -874,6 +938,7 @@ class TestDatalabFindNonIIDIssues:
     def test_find_non_iid_issues_sorted_using_pred_probs(self, lab, sorted_embeddings):
         pred_probs = pred_probs_from_features(sorted_embeddings)
         lab.find_issues(pred_probs=pred_probs, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert ["non_iid"] == summary["issue_type"].values
         assert summary["score"].values[0] == 0
@@ -881,12 +946,14 @@ class TestDatalabFindNonIIDIssues:
         assert "weighted_knn_graph" not in lab.get_info("statistics")
 
     def test_incremental_search(self, lab, sorted_embeddings):
-        lab.find_issues(features=sorted_embeddings)
+        lab.find_issues(features=sorted_embeddings, issue_types={"null": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
-        assert len(summary) == 5
+        assert len(summary) == 1
         lab.find_issues(features=sorted_embeddings, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
-        assert len(summary) == 5
+        assert len(summary) == 2
         assert "non_iid" in summary["issue_type"].values
         non_iid_summary = lab.get_issue_summary("non_iid")
         assert non_iid_summary["score"].values[0] == 0
@@ -895,9 +962,11 @@ class TestDatalabFindNonIIDIssues:
     def test_incremental_search_using_pred_probs(self, lab, sorted_embeddings):
         pred_probs = pred_probs_from_features(sorted_embeddings)
         lab.find_issues(pred_probs=pred_probs, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         lab.find_issues(pred_probs=pred_probs, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "non_iid" in summary["issue_type"].values
@@ -918,6 +987,7 @@ class TestDatalabFindNonIIDIssues:
         lab.find_issues(
             features=random_embeddings, pred_probs=pred_probs, issue_types={"outlier": {}}
         )
+        check_lab_dtypes(lab)
         cached_knn_graph = lab.get_info("statistics").get("weighted_knn_graph")
         assert cached_knn_graph is not None
         lab.find_issues(pred_probs=pred_probs, issue_types={"non_iid": {}})
@@ -930,6 +1000,7 @@ class TestDatalabFindNonIIDIssues:
         lab_2.find_issues(
             pred_probs=pred_probs, knn_graph=cached_knn_graph, issue_types={"non_iid": {}}
         )
+        check_lab_dtypes(lab_2)
         knn_graph_after_non_iid = lab.get_info("statistics").get("weighted_knn_graph")
         # Check if stored knn graph is same as the knn graph passed to find_issues
         assert cached_knn_graph is knn_graph_after_non_iid
@@ -937,6 +1008,17 @@ class TestDatalabFindNonIIDIssues:
         # leads to the same results.
         issues_2 = lab_2.get_issues("non_iid")
         pd.testing.assert_frame_equal(issues_1, issues_2)
+
+    def test_all_identical_dataset(self):
+        """Test that the non-IID issue finder correctly identifies an all-identical dataset."""
+        N, M = 200, 10
+        data = {"labels": [0] * N}
+        features = np.full((N, M), fill_value=np.random.rand(M))
+        lab = Datalab(data=data, label_name="labels")
+        lab.find_issues(features=features, issue_types={"non_iid": {}})
+        check_lab_dtypes(lab)
+        assert lab.get_issues()["is_non_iid_issue"].sum() == 1
+        assert lab.get_issue_summary()["score"].values[0] < 0.05
 
 
 class TestDatalabFindLabelIssues:
@@ -955,10 +1037,12 @@ class TestDatalabFindLabelIssues:
         data = {"labels": np.random.randint(0, 2, 100)}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(features=random_embeddings)
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 6
         assert "label" in summary["issue_type"].values
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 6
         assert "label" in summary["issue_type"].values
@@ -969,6 +1053,7 @@ class TestDatalabFindLabelIssues:
         issue_types = {"label": {"clean_learning_kwargs": {"low_memory": True}}}
         lab_lm = Datalab(data=data, label_name="labels")
         lab_lm.find_issues(pred_probs=pred_probs, issue_types=issue_types)
+        check_lab_dtypes(lab_lm)
         issues_df_lm = lab_lm.get_issues("label")
         # jaccard similarity
         intersection = len(list(set(issues_df).intersection(set(issues_df_lm))))
@@ -979,10 +1064,12 @@ class TestDatalabFindLabelIssues:
         data = {"labels": np.random.randint(0, 2, 100)}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(features=random_embeddings, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "label" in summary["issue_type"].values
         lab.find_issues(features=random_embeddings, issue_types={"label": {"k": 5}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "label" in summary["issue_type"].values
@@ -991,6 +1078,7 @@ class TestDatalabFindLabelIssues:
         data = {"labels": np.random.randint(0, 2, 100)}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert "label" in summary["issue_type"].values
         label_summary_pred_probs = lab.get_issue_summary("label")
@@ -999,6 +1087,7 @@ class TestDatalabFindLabelIssues:
         lab.find_issues(
             features=random_embeddings, pred_probs=pred_probs, issue_types={"label": {}}
         )
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert "label" in summary["issue_type"].values
         label_summary_both = lab.get_issue_summary("label")
@@ -1026,15 +1115,29 @@ class TestDatalabFindOutlierIssues:
         data = {"labels": np.random.randint(0, 2, 100)}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "outlier" not in summary["issue_type"].values
         lab.find_issues(features=random_embeddings, issue_types={"outlier": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 2
         assert "outlier" in summary["issue_type"].values
         outlier_summary = lab.get_issue_summary("outlier")
         assert outlier_summary["num_issues"].values[0] > 0
+
+    def test_all_identical_dataset(self):
+        """Test that the non-IID issue finder correctly identifies an all-identical dataset."""
+        N, M = 200, 10
+        data = {"labels": [0] * N}
+        features = np.full((N, M), fill_value=np.random.rand(M))
+        lab = Datalab(data=data, label_name="labels")
+        lab.find_issues(features=features, issue_types={"outlier": {}})
+        check_lab_dtypes(lab)
+        outlier_issues = lab.get_issues("outlier")
+        assert outlier_issues["is_outlier_issue"].sum() == 0
+        np.testing.assert_allclose(outlier_issues["outlier_score"].to_numpy(), 1)
 
 
 class TestDatalabFindNearDuplicateIssues:
@@ -1078,10 +1181,12 @@ class TestDatalabFindNearDuplicateIssues:
         data = {"labels": np.random.randint(0, 2, 100)}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "near_duplicate" not in summary["issue_type"].values
         lab.find_issues(features=random_embeddings, issue_types={"near_duplicate": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 2
         assert "near_duplicate" in summary["issue_type"].values
@@ -1091,6 +1196,7 @@ class TestDatalabFindNearDuplicateIssues:
     def test_fixed_embeddings_outputs(self, fixed_embeddings):
         lab = Datalab(data={"a": ["" for _ in range(len(fixed_embeddings))]})
         lab.find_issues(features=fixed_embeddings, issue_types={"near_duplicate": {}})
+        check_lab_dtypes(lab)
         issues = lab.get_issues("near_duplicate")
 
         assert issues["is_near_duplicate_issue"].sum() == 18
@@ -1148,6 +1254,18 @@ class TestDatalabFindNearDuplicateIssues:
         unique_non_empty_sets = [tuple(s) for s in near_duplicate_sets if len(s) > 0]
         assert len(set(unique_non_empty_sets)) == 18
 
+    def test_all_identical_dataset(self):
+        """Test that the non-IID issue finder correctly identifies an all-identical dataset."""
+        N, M = 200, 10
+        data = {"labels": [0] * N}
+        features = np.full((N, M), fill_value=np.random.rand(M))
+        lab = Datalab(data=data, label_name="labels")
+        lab.find_issues(features=features, issue_types={"near_duplicate": {}})
+        check_lab_dtypes(lab)
+        near_duplicate_issues = lab.get_issues("near_duplicate")
+        assert near_duplicate_issues["is_near_duplicate_issue"].sum() == N
+        np.testing.assert_allclose(near_duplicate_issues["near_duplicate_score"].to_numpy(), 0)
+
 
 class TestDatalabWithoutLabels:
     num_examples = 100
@@ -1181,21 +1299,26 @@ class TestDatalabWithoutLabels:
     def test_find_issues(self, lab, features, pred_probs):
         lab = Datalab(data={"X": features})
         lab.find_issues(pred_probs=pred_probs)
+        check_lab_dtypes(lab)
         assert set(lab.issues.columns) == {"is_non_iid_issue", "non_iid_score"}
 
         lab = Datalab(data={"X": features})
         lab.find_issues(features=features)
+        check_lab_dtypes(lab)
         assert not lab.issues.empty
 
     def test_find_issues_features_works_with_and_without_labels(self, features, labels):
         lab_without_labels = Datalab(data={"X": features})
         lab_without_labels.find_issues(features=features)
+        check_lab_dtypes(lab_without_labels)
 
         lab_with_labels = Datalab(data={"X": features, "labels": labels}, label_name="labels")
         lab_with_labels.find_issues(features=features)
+        check_lab_dtypes(lab_with_labels)
 
         lab_without_label_name = Datalab(data={"X": features, "labels": labels})
         lab_without_label_name.find_issues(features=features)
+        check_lab_dtypes(lab_without_label_name)
 
         issues_without_labels = lab_without_labels.issues
         issues_with_labels = lab_with_labels.issues
@@ -1234,10 +1357,12 @@ class TestDataLabClassImbalanceIssues:
         data = {"labels": imbalance_labels}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "class_imbalance" not in summary["issue_type"].values
         lab.find_issues(features=random_embeddings, issue_types={"class_imbalance": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 2
         assert "class_imbalance" in summary["issue_type"].values
@@ -1248,6 +1373,7 @@ class TestDataLabClassImbalanceIssues:
         data = {"labels": imbalance_labels}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(issue_types={"class_imbalance": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "class_imbalance" in summary["issue_type"].values
@@ -1279,12 +1405,14 @@ class TestDataLabUnderperformingIssue:
         features, labels, pred_probs = data["features"], data["labels"], data["pred_probs"]
         lab = Datalab(data={"labels": labels}, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "underperforming_group" not in summary["issue_type"].values
         lab.find_issues(
             features=features, pred_probs=pred_probs, issue_types={"underperforming_group": {}}
         )
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 2
         assert "underperforming_group" in summary["issue_type"].values
@@ -1319,6 +1447,7 @@ class TestDataLabUnderperformingIssue:
             pred_probs=pred_probs,
             issue_types={"underperforming_group": {"cluster_ids": cluster_ids}},
         )
+        check_lab_dtypes(lab)
         info = lab.get_info("underperforming_group")
         assert info["clustering"]["stats"]["underperforming_cluster_id"] == bad_cluster_id
         # Check that no underperforming cluster is found for correct predictions
@@ -1328,8 +1457,69 @@ class TestDataLabUnderperformingIssue:
             pred_probs=pred_probs,
             issue_types={"underperforming_group": {"cluster_ids": cluster_ids}},
         )
+        check_lab_dtypes(lab)
         info = lab.get_info("underperforming_group")
         assert info["clustering"]["stats"]["underperforming_cluster_id"] not in cluster_ids
+
+    def test_underperforming_clusters_scores(self):
+        """
+        Test that the issue manager assigns the cluster quality score for each underperforming cluster
+        """
+        np.random.seed(SEED)
+        N = 200
+        K = 5
+        n_clusters = 4
+        bad_cluster_ids = [2, 3]
+        worst_cluster_id = 2
+        flip_rates = [0.95, 0.5]
+        cluster_ids = np.random.choice(np.arange(n_clusters), size=N)
+        labels = np.random.choice(np.arange(K), size=N)
+        pred_probs = np.full((N, K), 0.001)
+        pred_probs[np.arange(N), labels] = 0.99  # Set any high value
+        pred_probs = pred_probs / np.sum(pred_probs, axis=-1, keepdims=True)
+        pred_probs_correct = np.copy(pred_probs)
+        # Flip prediction probabilities of samples belonging to bad clusters
+        for i, bad_cluster_id in enumerate(bad_cluster_ids):
+            bad_cluster_indices = np.where(cluster_ids == bad_cluster_id)[0]
+            flip_indices = np.random.choice(
+                bad_cluster_indices,
+                size=int(flip_rates[i] * len(bad_cluster_indices)),
+                replace=False,
+            )
+            pred_probs[flip_indices] = 1 - pred_probs[flip_indices]  # Incorrect predictions
+        features = np.random.rand(len(labels), 2)
+        lab = Datalab(data={"labels": labels}, label_name="labels")
+        lab.find_issues(
+            features=features,
+            pred_probs=pred_probs,
+            issue_types={"underperforming_group": {"cluster_ids": cluster_ids}},
+        )
+        check_lab_dtypes(lab)
+        issues = lab.get_issues("underperforming_group")
+        cluster_ids_to_score = {2: 0.097, 3: 0.8208}
+        expected_scores = np.ones(N)
+        for cluster_id, cluster_score in cluster_ids_to_score.items():
+            expected_scores[cluster_ids == cluster_id] = cluster_score
+
+        np.testing.assert_allclose(
+            issues["underperforming_group_score"],
+            expected_scores,
+            err_msg="Scores should be correct",
+            rtol=1e-3,
+        )
+        info = lab.get_info("underperforming_group")
+        assert info["clustering"]["stats"]["underperforming_cluster_id"] == worst_cluster_id
+        assert lab.get_issue_summary()["score"].values[0] == pytest.approx(
+            cluster_ids_to_score[worst_cluster_id], rel=1e-3
+        )
+        # Check that all scores are 1.0 for correct predictions
+        lab.find_issues(
+            features=features,
+            pred_probs=pred_probs_correct,
+            issue_types={"underperforming_group": {"cluster_ids": cluster_ids}},
+        )
+        check_lab_dtypes(lab)
+        assert lab.get_issue_summary()["score"].values[0] == 1.0
 
     def test_features_and_knn_graph(self, data):
         """
@@ -1342,6 +1532,7 @@ class TestDataLabUnderperformingIssue:
         lab.find_issues(
             features=features, pred_probs=pred_probs, issue_types={"underperforming_group": {}}
         )
+        check_lab_dtypes(lab)
         issues_1 = lab.get_issues("underperforming_group")
         knn_graph = lab.get_info("statistics")["weighted_knn_graph"]
         # Use another datalab instance to check preference of knn graph over features
@@ -1353,6 +1544,7 @@ class TestDataLabUnderperformingIssue:
             knn_graph=knn_graph,
             issue_types={"underperforming_group": {}},
         )
+        check_lab_dtypes(lab)
         issues_2 = lab.get_issues("underperforming_group")
         pd.testing.assert_frame_equal(issues_1, issues_2)
 
@@ -1364,6 +1556,7 @@ class TestDataLabUnderperformingIssue:
             pred_probs=pred_probs,
             issue_types={"underperforming_group": {"cluster_ids": labels}},
         )
+        check_lab_dtypes(lab)
         info = lab.get_info("underperforming_group")
         assert info["clustering"]["algorithm"] is None
         underperforming_group_summary = lab.get_issue_summary("underperforming_group")
@@ -1377,6 +1570,7 @@ class TestDataLabUnderperformingIssue:
             ),
             number=1,
         )
+        check_lab_dtypes(lab)
         # Use another datalab instance to emphasize absense of precomputed info
         lab = Datalab(data={"labels": labels}, label_name="labels")
         time_without_clustering = timeit.timeit(
@@ -1387,6 +1581,7 @@ class TestDataLabUnderperformingIssue:
             ),
             number=1,
         )
+        check_lab_dtypes(lab)
         # find_issues must be slower when clustering needs to be performed.
         assert (
             time_without_clustering < time_with_clustering
@@ -1400,7 +1595,25 @@ class TestDataLabUnderperformingIssue:
             pred_probs=pred_probs,
             issue_types={"underperforming_group": {"cluster_ids": np.array([], dtype=int)}},
         )
+        check_lab_dtypes(lab)
         assert len(lab.issue_summary["issue_type"].values) == 0
+
+    def test_all_identical_dataset(self):
+        """Test that the non-IID issue finder correctly handles an all-identical dataset."""
+        N, M = 200, 10
+        data = {"labels": [0] * N}
+        features = np.full((N, M), fill_value=np.random.rand(M))
+        pred_probs = np.full((N, 2), fill_value=[1, 0])
+        lab = Datalab(data=data, label_name="labels")
+        lab.find_issues(
+            features=features, pred_probs=pred_probs, issue_types={"underperforming_group": {}}
+        )
+        check_lab_dtypes(lab)
+        underperforming_issues = lab.get_issues("underperforming_group")
+        assert underperforming_issues["is_underperforming_group_issue"].sum() == 0
+        np.testing.assert_allclose(
+            underperforming_issues["underperforming_group_score"].to_numpy(), 1
+        )
 
 
 class TestDataLabNullIssues:
@@ -1433,10 +1646,12 @@ class TestDataLabNullIssues:
         data = {"labels": labels}
         lab = Datalab(data=data, label_name="labels")
         lab.find_issues(pred_probs=pred_probs, issue_types={"label": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 1
         assert "class_imbalance" not in summary["issue_type"].values
         lab.find_issues(features=embeddings_with_null, issue_types={"null": {}})
+        check_lab_dtypes(lab)
         summary = lab.get_issue_summary()
         assert len(summary) == 2
         assert "null" in summary["issue_type"].values
@@ -1446,6 +1661,7 @@ class TestDataLabNullIssues:
     def test_null_issues(self, embeddings_with_null):
         lab = Datalab(data={"features": embeddings_with_null})
         lab.find_issues(features=embeddings_with_null, issue_types={"null": {}})
+        check_lab_dtypes(lab)
         issues = lab.get_issues("null")
         expected_issue_mask = np.zeros(100, dtype=bool)
         expected_issue_mask[[5, 10, 22]] = True
@@ -1549,6 +1765,7 @@ class TestDatalabDataValuation:
             lab = Datalab(data=dataset, label_name=self.label_name)
             assert lab.issue_summary.empty
             lab.find_issues(**kwargs, issue_types={"data_valuation": {}})
+            check_lab_dtypes(lab)
             summary = lab.get_issue_summary()
             assert len(summary) == 1
             assert "data_valuation" in summary["issue_type"].values
@@ -1584,6 +1801,7 @@ class TestDatalabDataValuation:
 
         lab = Datalab(data=dataset, label_name=self.label_name)
         lab.find_issues(features=dataset["X"], issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
 
         # The default metric should be "cosine" for "high-dimensional" features
         assert lab.get_info("statistics")["knn_metric"] == "cosine"
@@ -1604,11 +1822,323 @@ class TestDatalabDataValuation:
             lab.find_issues(
                 features=dataset["X"], issue_types={"data_valuation": {"metric": metric}}
             )
+            check_lab_dtypes(lab)
             assert metric == lab.get_info("statistics")["knn_metric"]
             assert np.allclose(
                 expected_knn_graph.toarray(),
                 lab.get_info("statistics")["weighted_knn_graph"].toarray(),
             )
+
+    def test_all_identical_dataset(self):
+        """Test that the data_valuation issue finder correctly handles an all-identical dataset."""
+        N, M = 11, 10
+        data = {"labels": [0] * N}
+        features = np.full((N, M), fill_value=np.random.rand(M))
+        lab = Datalab(data=data, label_name="labels")
+        lab.find_issues(features=features, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+        data_valuation_issues = lab.get_issues("data_valuation")
+        assert data_valuation_issues["is_data_valuation_issue"].sum() == 0
+
+        # For a full knn-graph, all data points have the same value. Here, they all contribute the same value.
+        np.testing.assert_allclose(data_valuation_issues["data_valuation_score"].to_numpy(), 0.5)
+
+    @pytest.mark.parametrize("N", [40, 100])
+    @pytest.mark.parametrize("M", [2, 3, 4])
+    def test_label_error_has_lower_data_valuation_score(self, N, M):
+        """Test that the for one point with a label error (in a binary classification task for a 2D blob dataset), its data valuation score is lower than the others."""
+        np.random.seed(SEED)  # Set seed for reproducibility
+
+        X, y_true = make_blobs(n_samples=N, centers=2, n_features=M, random_state=SEED)
+
+        # Add label error to one data point
+        idx = np.random.choice(N, 1)
+        y_noisy = np.copy(y_true)
+        y_noisy[idx] = 1 - y_noisy[idx]
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X, "y": y_noisy}, label_name="y")
+        lab.find_issues(features=X, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+
+        # At least one point has a data valuation issue (the one with the label error)
+        issue_ids = data_valuation_issues.query("is_data_valuation_issue").index.tolist()
+        num_issues = len(issue_ids)
+        assert num_issues == 1
+
+        # The scores should be lower for points with label errors
+        scores = data_valuation_issues["data_valuation_score"].to_numpy()
+        np.testing.assert_array_less(
+            scores[idx], 0.5
+        )  # The point with the obvious label error should have a score lower than 0.5
+        # But any other example flagged as an issue may have the same score or greater
+        if num_issues > 1:
+            assert np.all(scores[idx][0] <= scores[issue_ids]) and np.all(scores[issue_ids] < 0.5)
+        np.testing.assert_array_less(
+            scores[idx][0], np.delete(scores, issue_ids)
+        )  # All other points should have a higher score
+
+    def test_outlier_has_lower_data_valuation_score(self):
+        """Test that for one point being an outlier (in a binary classification task for a 2D blob dataset), its data valuation score is lower than the others.
+
+        TODO: Figure out when we can assert that an outlier gets a data valuation score of 0.0 (while not necessarily being a label error).
+        """
+        np.random.seed(SEED)  # Set seed for reproducibility
+
+        N, M = 20, 10
+        X, y_true = make_blobs(n_samples=N, centers=2, n_features=M, random_state=SEED)
+
+        # Turn one data point into an outlier
+        idx = np.random.choice(N, 1)
+        X_outlier = np.copy(X)
+        X_outlier[idx] *= -1  # Making the point an outlier, by flipping the sign of all features
+
+        # Validate the outlier creation
+        assert not np.array_equal(X[idx], X_outlier[idx]), "Outlier creation failed."
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X_outlier, "y": y_true}, label_name="y")
+        lab.find_issues(features=X_outlier, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+
+        # The scores should be lower for points with outliers
+        scores = data_valuation_issues["data_valuation_score"].to_numpy()
+
+        # Validate scores are within an expected range (if applicable)
+        assert np.all(scores >= 0) and np.all(
+            scores <= 1
+        ), "Scores are out of the expected range [0, 1]."
+
+        # Check the outlier's score
+        assert np.all(
+            scores[idx] == 0.5
+        ), "The outlier should have a score equal to 0.5."  # Only this particular random seed guarantees this
+        np.testing.assert_array_less(
+            scores[idx][0], np.delete(scores, idx)
+        )  # All other points should have a higher score
+
+    def test_duplicate_points_have_similar_scores(self):
+        """Test that duplicate points in the dataset have similar data valuation scores, which are higher compared to non-duplicate points."""
+        np.random.seed(SEED)  # Set seed for reproducibility
+
+        N, M = 50, 5
+        X, y = make_blobs(n_samples=N, centers=2, n_features=M, random_state=SEED)
+
+        # Introduce duplicate points
+        duplicate_indices = np.random.choice(N, 2, replace=False)
+        X[duplicate_indices[1]] = X[duplicate_indices[0]]
+        y[duplicate_indices[1]] = y[duplicate_indices[0]]
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X, "y": y}, label_name="y")
+        lab.find_issues(features=X, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+
+        # The duplicate points don't have data valuation issues
+        assert data_valuation_issues["is_data_valuation_issue"][duplicate_indices].sum() == 0
+
+        # The scores for duplicate points should be similar
+        scores = data_valuation_issues["data_valuation_score"].to_numpy()
+
+        duplicate_scores = scores[duplicate_indices]
+        non_duplicate_scores = np.delete(scores, duplicate_indices)
+
+        # Check that duplicate points have identical scores
+        assert len(set(duplicate_scores)) == 1
+
+        # Check that duplicate points have higher scores than non-duplicate points
+        assert np.all(non_duplicate_scores <= duplicate_scores[0])
+
+        ### Now add label noise to one of the duplicates
+
+        y[duplicate_indices[0]] = 1 - y[duplicate_indices[0]]
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X, "y": y}, label_name="y")
+        lab.find_issues(features=X, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+        is_issue = data_valuation_issues["is_data_valuation_issue"]
+        scores = data_valuation_issues["data_valuation_score"]
+
+        # Only one of the duplicates points should have a data valuation issue
+        assert is_issue.sum() == 1
+        assert is_issue[duplicate_indices].sum() == 1
+
+        # The scores should be as low as possible
+        assert scores[duplicate_indices[0]] == 0.491
+        assert scores[duplicate_indices[1]] == 0.500
+
+    def add_label_noise(self, y, noise_level=0.1):
+        """Introduce random label noise to the labels."""
+        np.random.seed(SEED)
+        n_samples = len(y)
+        n_noisy = int(noise_level * n_samples)
+        noisy_indices = np.random.choice(n_samples, n_noisy, replace=False)
+        y_noisy = np.copy(y)
+        y_noisy[noisy_indices] = 1 - y_noisy[noisy_indices]  # Flip the labels
+        return y_noisy, noisy_indices
+
+    @pytest.mark.parametrize("remove_percentage", [0.2, 0.3, 0.4, 0.5])
+    def test_removing_low_valuation_points_improves_classification_accuracy_binary(
+        self, remove_percentage
+    ):
+        """Test that removing the bottom X% of data valuation scores improves ML performance compared to removing random points.
+
+        NOTES
+        -----
+        - This is applied to a binary classification task on a 2D dataset.
+        - This test does not consider filtering by the `is_data_valuation_issue` column before setting the threshold.
+        """
+        np.random.seed(SEED)  # Set seed for reproducibility
+
+        N, M = 300, 5
+
+        X, y_true = make_blobs(n_samples=N, centers=2, n_features=M, random_state=SEED)
+
+        # Split data into training and testing sets
+        X_train, X_test, y_train_true, y_test = train_test_split(
+            X, y_true, test_size=0.3, random_state=SEED
+        )
+
+        # Introduce random label noise
+        noise_level = 0.4
+        y_noisy, noisy_indices = self.add_label_noise(y_train_true, noise_level)
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X_train, "y": y_noisy}, label_name="y")
+        lab.find_issues(features=X_train, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+        scores = data_valuation_issues["data_valuation_score"].to_numpy()
+
+        # Calculate the threshold for the bottom X% of scores
+        threshold = np.percentile(scores, remove_percentage * 100)
+
+        # Identify the indices to remove based on data valuation scores
+        indices_to_remove_valuation = np.where(scores <= threshold)[0]
+
+        # Create training set by removing the identified points
+        X_train_valuation_removed = np.delete(X_train, indices_to_remove_valuation, axis=0)
+        y_train_noisy_valuation_removed = np.delete(y_noisy, indices_to_remove_valuation, axis=0)
+
+        # Train a model on the reduced dataset
+        clf_valuation = LogisticRegression(random_state=SEED)
+        clf_valuation.fit(X_train_valuation_removed, y_train_noisy_valuation_removed)
+        y_pred_valuation = clf_valuation.predict(X_test)
+        accuracy_valuation = accuracy_score(y_test, y_pred_valuation)
+
+        # Randomly remove the same amount of data points
+        random_indices = np.random.choice(
+            len(X_train), len(indices_to_remove_valuation), replace=False
+        )
+        X_train_random_removed = np.delete(X_train, random_indices, axis=0)
+        y_train_noisy_random_removed = np.delete(y_noisy, random_indices, axis=0)
+
+        # Train a model on the randomly reduced dataset
+        clf_random = LogisticRegression(random_state=SEED)
+        clf_random.fit(X_train_random_removed, y_train_noisy_random_removed)
+        y_pred_random = clf_random.predict(X_test)
+        accuracy_random = accuracy_score(y_test, y_pred_random)
+
+        # Assert that removing low valuation points leads to better performance
+        assert (
+            accuracy_valuation > accuracy_random
+        ), f"Expected accuracy with valuation removal ({accuracy_valuation}) to be higher than random removal ({accuracy_random})"
+        if accuracy_valuation < 1.0:
+            assert (1 - accuracy_random) / (
+                1 - accuracy_valuation
+            ) >= 1.6, "Expected at least a 60% improvement in error rate after removing low valuation points"
+
+    def add_multi_class_noise(self, y, noise_level=0.1):
+        """Introduce random label noise to the labels."""
+        np.random.seed(SEED)
+        n_samples = len(y)
+        n_noisy = int(noise_level * n_samples)
+        noisy_indices = np.random.choice(n_samples, n_noisy, replace=False)
+        y_noisy = np.copy(y)
+        y_noisy[noisy_indices] = np.random.choice(
+            np.delete(np.unique(y), y[noisy_indices]), n_noisy
+        )
+        return y_noisy, noisy_indices
+
+    @pytest.mark.parametrize("remove_percentage", [0.2, 0.3, 0.4, 0.5])
+    def test_removing_low_valuation_points_improves_classification_accuracy_multi_class(
+        self, remove_percentage
+    ):
+        """Test that removing the bottom X% of data valuation scores improves ML performance compared to removing random points.
+
+        NOTES
+        -----
+        - This is applied to a multi-class classification task on a 2D dataset.
+        - This test does not consider filtering by the `is_data_valuation_issue` column before setting the threshold.
+        """
+        np.random.seed(SEED)
+
+        N, M = 300, 5
+        X, y_true = make_blobs(n_samples=N, centers=4, n_features=M, random_state=SEED)
+        # Split data into training and testing sets
+        X_train, X_test, y_train_true, y_test = train_test_split(
+            X, y_true, test_size=0.3, random_state=SEED
+        )
+
+        # Introduce random label noise
+        noise_level = 0.3
+        y_noisy, noisy_indices = self.add_label_noise(y_train_true, noise_level)
+
+        # Run dataset through Datalab
+        lab = Datalab(data={"X": X_train, "y": y_noisy}, label_name="y")
+        lab.find_issues(features=X_train, issue_types={"data_valuation": {}})
+        check_lab_dtypes(lab)
+
+        data_valuation_issues = lab.get_issues("data_valuation")
+        scores = data_valuation_issues["data_valuation_score"].to_numpy()
+
+        # Calculate the threshold for the bottom X% of scores
+        threshold = np.percentile(scores, remove_percentage * 100)
+
+        # Identify the indices to remove based on data valuation scores
+        indices_to_remove_valuation = np.where(scores <= threshold)[0]
+
+        # Create training set by removing the identified points
+        X_train_valuation_removed = np.delete(X_train, indices_to_remove_valuation, axis=0)
+        y_train_noisy_valuation_removed = np.delete(y_noisy, indices_to_remove_valuation, axis=0)
+
+        # Train a model on the reduced dataset
+        clf_valuation = LogisticRegression(random_state=SEED)
+        clf_valuation.fit(X_train_valuation_removed, y_train_noisy_valuation_removed)
+        y_pred_valuation = clf_valuation.predict(X_test)
+        accuracy_valuation = accuracy_score(y_test, y_pred_valuation)
+
+        # Randomly remove the same amount of data points
+        random_indices = np.random.choice(
+            len(X_train), len(indices_to_remove_valuation), replace=False
+        )
+        X_train_random_removed = np.delete(X_train, random_indices, axis=0)
+        y_train_noisy_random_removed = np.delete(y_noisy, random_indices, axis=0)
+
+        # Train a model on the randomly reduced dataset
+        clf_random = LogisticRegression(random_state=SEED)
+        clf_random.fit(X_train_random_removed, y_train_noisy_random_removed)
+        y_pred_random = clf_random.predict(X_test)
+        accuracy_random = accuracy_score(y_test, y_pred_random)
+
+        # Assert that removing low valuation points leads to better performance
+        assert (
+            accuracy_valuation > accuracy_random
+        ), f"Expected accuracy with valuation removal ({accuracy_valuation}) to be higher than random removal ({accuracy_random})"
+        if accuracy_valuation < 1.0:
+            assert (1 - accuracy_random) / (
+                1 - accuracy_valuation
+            ) >= 1.6, "Expected at least a 60% improvement in error rate after removing low valuation points"
 
 
 class TestIssueManagersReuseKnnGraph:
@@ -1702,8 +2232,9 @@ class TestDatalabDefaultReporting:
             lab.report()
         report = f.getvalue()
         expected_header = (
-            "Here is a summary of the different kinds of issues found in the data:"
-            "\n\nissue_type  num_issues\n     label           1\n\n"
+            "Dataset Information: num_examples: 100, num_classes: 2\n\n"  # Starts with dataset info
+            "Here is a summary of various issues found in your data:"  # Then a preamble
+            "\n\nissue_type  num_issues\n     label           1\n\n"  # Then a summary of issues
         )
         assert report.startswith(
             expected_header

@@ -46,6 +46,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "nbsphinx",
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosectionlabel",
     "autodocsumm",
     "sphinx.ext.viewcode",
     "sphinx.ext.todo",
@@ -172,6 +173,13 @@ html_context = {
     # Add new tags to RELEASE_VERSIONS before release
     # fmt: off
     "RELEASE_VERSIONS": [
+        "v2.7.0",
+        "v2.6.6",
+        "v2.6.5",
+        "v2.6.4",
+        "v2.6.3",
+        "v2.6.2",
+        "v2.6.1",
         "v2.6.0",
         "v2.5.0",
         "v2.4.0",
