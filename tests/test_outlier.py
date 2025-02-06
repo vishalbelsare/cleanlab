@@ -17,14 +17,19 @@
 import numpy as np
 import pandas as pd
 import pytest
-from cleanlab.benchmarking.noise_generation import generate_noise_matrix_from_trace
-from cleanlab.benchmarking.noise_generation import generate_noisy_labels
-from cleanlab import count, outlier
-from cleanlab.count import get_confident_thresholds
-from cleanlab.outlier import OutOfDistribution
-from cleanlab.internal.label_quality_utils import get_normalized_entropy
-from sklearn.neighbors import NearestNeighbors
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from sklearn.linear_model import LogisticRegression as LogReg
+from sklearn.neighbors import NearestNeighbors
+
+from cleanlab import count, outlier
+from cleanlab.benchmarking.noise_generation import (
+    generate_noise_matrix_from_trace,
+    generate_noisy_labels,
+)
+from cleanlab.count import get_confident_thresholds
+from cleanlab.internal.label_quality_utils import get_normalized_entropy
+from cleanlab.outlier import OutOfDistribution
 
 
 def make_data(
@@ -223,7 +228,7 @@ def test_class_public_func():
     labels = data["true_labels_test"]
 
     # Fit Logistic Regression model on X_train and estimate train pred_probs
-    logreg = LogReg(multi_class="auto", solver="lbfgs")
+    logreg = LogReg(solver="lbfgs")
     logreg.fit(data["X_train"], data["true_labels_train"])
     train_pred_probs = logreg.predict_proba(data["X_train"])
 
@@ -275,7 +280,8 @@ def test_class_public_func():
     X_small = np.random.rand(20, 3)
     OOD_euclidean = OutOfDistribution()
     OOD_euclidean.fit(features=X_small)
-    assert OOD_euclidean.params["knn"].metric == "euclidean"
+    # The metric attribute is the pairwise distance function implemented in scipy, use __name__ to get the name of the function
+    assert OOD_euclidean.params["knn"].metric.__name__ == "euclidean"
     X_small_with_ood = np.vstack([X_small, [999999.0] * 3])
     euclidean_score = OOD_euclidean.score(features=X_small_with_ood)
     assert (np.max(euclidean_score) <= 1) and (np.min(euclidean_score) >= 0)
@@ -484,7 +490,7 @@ def test_ood_predictions_scores():
     y_with_ood = np.hstack([y, data["true_labels_train"][1]])
 
     # Fit Logistic Regression model on X_train and estimate pred_probs
-    logreg = LogReg(multi_class="auto", solver="lbfgs")
+    logreg = LogReg(solver="lbfgs")
     logreg.fit(data["X_train"], data["true_labels_train"])
     pred_probs = logreg.predict_proba(X_with_ood)
 
@@ -653,3 +659,61 @@ def test_wrong_info_get_ood_predictions_scores():
         labels=data["labels"],
         adjust_pred_probs=False,  # this should user warning because provided info is not used
     )
+
+
+@given(
+    fill_value=st.floats(
+        min_value=5 * float(np.finfo(np.float64).eps),
+        max_value=5,
+        exclude_min=False,
+        allow_subnormal=False,
+        allow_infinity=False,
+        allow_nan=False,
+    ),
+    K=st.integers(min_value=2, max_value=100),
+)
+@example(K=1, fill_value=0.0)
+@settings(deadline=None)
+def test_scores_for_identical_examples(fill_value, K):
+    N = 100
+
+    features = np.full((N, K), fill_value=fill_value)
+    ood = OutOfDistribution()
+    scores = ood.fit_score(features=features, verbose=False)
+
+    # Dataset with only
+    expected_score = np.full(N, 1.0)
+    np.testing.assert_array_equal(
+        scores,
+        expected_score,
+        err_msg=f"The calculated distances were {ood.params['knn'].kneighbors()}",
+    )
+
+
+@given(K=st.integers(min_value=2, max_value=100))
+@settings(max_examples=10000, deadline=None)
+def test_scores_for_identical_examples_across_rows(K):
+    N = 100
+    fill_value = np.random.random(K)
+    features = np.full((N, K), fill_value=fill_value)
+    ood = OutOfDistribution()
+    scores = ood.fit_score(features=features, verbose=False)
+
+    # Dataset with only
+    expected_score = np.full(N, 1.0)
+    np.testing.assert_array_equal(
+        scores,
+        expected_score,
+        err_msg=f"The calculated distances were {ood.params['knn'].kneighbors()}",
+    )
+
+    if K < 4:
+        # This little changes should not affect euclidean calculation
+        features += np.random.random(features.shape) * 1e-10
+        ood = OutOfDistribution()
+        scores = ood.fit_score(features=features, verbose=False)
+        np.testing.assert_array_equal(
+            scores,
+            expected_score,
+            err_msg=f"The calculated distances were {ood.params['knn'].kneighbors()}",
+        )

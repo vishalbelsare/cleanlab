@@ -18,11 +18,12 @@
 Methods to display images and their label issues in a semantic segmentation dataset, as well as summarize the overall types of issues identified.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+
 
 from cleanlab.internal.segmentation_utils import _get_summary_optional_params
 
@@ -35,6 +36,7 @@ def display_issues(
     class_names: Optional[List[str]] = None,
     exclude: Optional[List[int]] = None,
     top: Optional[int] = None,
+    **kwargs,  # Accepting additional kwargs for plt.show()
 ) -> None:
     """
     Display semantic segmentation label issues, showing images with problematic pixels highlighted.
@@ -87,6 +89,8 @@ def display_issues(
     exclude:
         Optional list of label classes that can be ignored in the errors, each element must be 0, 1, ..., K-1
 
+    kwargs
+        Additional keyword arguments to pass to ``plt.show()`` (matplotlib.pyplot.show).
     """
     class_names, exclude, top = _get_summary_optional_params(class_names, exclude, top)
     if labels is None and len(exclude) > 0:
@@ -99,8 +103,9 @@ def display_issues(
     try:
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
+        from matplotlib.axes import Axes
         from matplotlib.colors import ListedColormap
-    except:
+    except ImportError:
         raise ImportError('try "pip install matplotlib"')
 
     output_plots = (pred_probs is not None) + (labels is not None) + 1
@@ -128,37 +133,41 @@ def display_issues(
             handles=patches, loc="center", ncol=len(class_names), facecolor="white", fontsize=20
         )  # adjust fontsize for larger text
         plt.axis("off")
-        plt.show()
+        plt.show(**kwargs)
 
     for i in correct_ordering:
         # Show images
-        fig, axes = plt.subplots(1, output_plots, figsize=(5 * output_plots, 5))
+        _, axes = plt.subplots(1, output_plots, figsize=(5 * output_plots, 5))
         plot_index = 0
 
+        # Handle the different possible types of axes
+        if output_plots == 1:
+            axes_list = [cast(Axes, axes)]
+        else:
+            axes_list = cast(List[Axes], axes) if isinstance(axes, np.ndarray) else [axes]
+
         # First image - Given truth labels
-        if labels is not None:
-            axes[plot_index].imshow(cmap[labels[i]])
-            axes[plot_index].set_title("Given Labels")
+        if labels is not None and plot_index < len(axes_list):
+            axes_list[plot_index].imshow(cmap[labels[i]])
+            axes_list[plot_index].set_title("Given Labels")
             plot_index += 1
 
         # Second image - Argmaxed pred_probs
-        if pred_probs is not None:
-            axes[plot_index].imshow(cmap[np.argmax(pred_probs[i], axis=0)])
-            axes[plot_index].set_title("Argmaxed Prediction Probabilities")
+        if pred_probs is not None and plot_index < len(axes_list):
+            axes_list[plot_index].imshow(cmap[np.argmax(pred_probs[i], axis=0)])
+            axes_list[plot_index].set_title("Argmaxed Prediction Probabilities")
             plot_index += 1
 
         # Third image - Errors
-        if output_plots == 1:
-            ax = axes
-        else:
-            ax = axes[plot_index]
+        if plot_index < len(axes_list):
+            ax = axes_list[plot_index]
+            mask = np.full((h, w), True)
+            if labels is not None and len(exclude) != 0:
+                mask = ~np.isin(labels[i], exclude)
+            ax.imshow(issues[i] & mask, cmap=error_cmap, vmin=0, vmax=1)
+            ax.set_title(f"Image {i}: Suggested Errors (in Red)")
 
-        mask = np.full((h, w), True)
-        if labels is not None and len(exclude) != 0:
-            mask = ~np.isin(labels[i], exclude)
-        ax.imshow(issues[i] & mask, cmap=error_cmap, vmin=0, vmax=1)
-        ax.set_title(f"Image {i}: Suggested Errors (in Red)")
-        plt.show()
+        plt.show(**kwargs)
 
     return None
 
